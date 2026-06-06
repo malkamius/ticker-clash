@@ -3,7 +3,7 @@
 set -e
 
 DEPLOY_DIR="/servers/tickerclash"
-REPO_DIR="/home/gemini/repos/ticker-clash"
+REPO_DIR="/home/gemini/repos/kbs-cloud/ticker-clash"
 
 # Find Node.js path (default to NVM directory if not in current PATH)
 NODE_EXEC=$(which node || echo "/home/gemini/.nvm/versions/node/v24.16.0/bin/node")
@@ -66,7 +66,7 @@ User=gemini
 WorkingDirectory=$DEPLOY_DIR
 ExecStart=$NODE_BIN/node server.cjs
 Restart=on-failure
-Environment=NODE_ENV=production BACKEND_PORT=%I DATABASE_PATH=$DEPLOY_DIR/ticker_clash.db
+Environment=NODE_ENV=production BACKEND_PORT=%I FRONTEND_PORT=19003 DATABASE_PATH=$DEPLOY_DIR/ticker_clash.db AUTH_SERVER_URL=http://localhost:20001 HUB_API_URL=http://localhost:20000
 Environment="PATH=$NODE_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 [Install]
@@ -74,9 +74,9 @@ WantedBy=multi-user.target
 EOF
 
 # Reload and restart service instance
-echo "Reloading systemd and restarting tickerclash@4010 service..."
+echo "Reloading systemd and restarting tickerclash@20003 service..."
 sudo systemctl daemon-reload
-sudo systemctl enable tickerclash@4010
-sudo systemctl restart tickerclash@4010
+sudo systemctl enable tickerclash@20003
+sudo systemctl restart tickerclash@20003
 
 echo "=== Deployment Finished Successfully ==="

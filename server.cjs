@@ -22,7 +22,8 @@ const { OAuth2Client } = require('google-auth-library');
 const { initializeGame, tickMarket, executeAction, endTurn, cancelEndTurn, isPlayerVacant, generateRandomGameName } = require('./src/game/dist/gameState.js');
 
 const app = express();
-const PORT = process.env.BACKEND_PORT || 3001;
+app.set('trust proxy', 1);
+const PORT = process.env.BACKEND_PORT || 29003;
 
 // Initialize SQLite database
 const dbPath = process.env.DATABASE_PATH || 'ticker_clash.db';
@@ -99,6 +100,20 @@ app.use(cors({
 // In-memory presence tracker
 const activePresence = new Map(); // gameId -> Map(email -> timestamp)
 
+// In-memory pending auth requests for Electron browser-based polling
+// Key: token, Value: { sessionId, error, createdAt }
+const pendingAuths = new Map();
+
+// Periodic cleanup of expired tokens (> 5 minutes)
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, data] of pendingAuths.entries()) {
+    if (now - data.createdAt > 5 * 60 * 1000) {
+      pendingAuths.delete(token);
+    }
+  }
+}, 60000);
+
 function updatePresence(gameId, email) {
   if (!activePresence.has(gameId)) {
     activePresence.set(gameId, new Map());
@@ -125,7 +140,7 @@ app.get('/api/csrf-init', (req, res) => {
     httpOnly: false,
     path: '/',
     sameSite: 'lax',
-    secure: false
+    secure: req.secure || req.headers['x-forwarded-proto'] === 'https'
   });
   res.status(200).json({ success: true, csrfToken });
 });
@@ -147,112 +162,153 @@ function validateCSRF(req, res, next) {
 
 // Session User Retrieval Helper
 function getSessionUser(req, callback) {
-  const sessionId = req.headers['x-session-id'] || req.cookies['session_id'];
-  if (!sessionId) {
+  const headerSessionId = req.headers['x-session-id'];
+  const cookieSessionId = req.cookies['session_id'];
+
+  if (!headerSessionId && !cookieSessionId) {
     return callback(null, null);
   }
 
   const now = new Date().toISOString();
-  db.get(
-    `SELECT u.email, u.display_name, u.is_google_linked, u.games_played, u.games_won, u.password_hash 
-     FROM sessions s 
-     JOIN users u ON s.email = u.email 
-     WHERE s.id = ? AND s.expires_at > ?`,
-    [sessionId, now],
-    (err, row) => {
-      if (err) return callback(err, null);
-      if (!row) return callback(null, null);
-      callback(null, {
-        email: row.email,
-        displayName: row.display_name,
-        isGoogleLinked: row.is_google_linked === 1,
-        hasPassword: row.password_hash !== null && row.password_hash !== undefined,
-        stats: { gamesPlayed: row.games_played, gamesWon: row.games_won }
-      });
-    }
-  );
+
+  const querySession = (sid, next) => {
+    db.get(
+      `SELECT u.email, u.display_name, u.is_google_linked, u.games_played, u.games_won, u.password_hash 
+       FROM sessions s 
+       JOIN users u ON s.email = u.email 
+       WHERE s.id = ? AND s.expires_at > ?`,
+      [sid, now],
+      (err, row) => {
+        if (err || !row) return next(null);
+        next({
+          email: row.email,
+          displayName: row.display_name,
+          isGoogleLinked: row.is_google_linked === 1,
+          hasPassword: row.password_hash !== null && row.password_hash !== undefined,
+          stats: { gamesPlayed: row.games_played, gamesWon: row.games_won }
+        });
+      }
+    );
+  };
+
+  if (headerSessionId) {
+    querySession(headerSessionId, (user) => {
+      if (user) {
+        return callback(null, user);
+      }
+      if (cookieSessionId) {
+        querySession(cookieSessionId, (cookieUser) => {
+          callback(null, cookieUser);
+        });
+      } else {
+        callback(null, null);
+      }
+    });
+  } else {
+    querySession(cookieSessionId, (user) => {
+      callback(null, user);
+    });
+  }
 }
 
 // --- AUTHENTICATION ENDPOINTS ---
 
-app.post('/api/register', validateCSRF, (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password || password.length < 6) {
-    return res.status(400).json({ error: 'Valid email and password (min 6 characters) required.' });
+// Endpoint: SSO Auth Callback redirect
+app.get('/api/auth/callback', async (req, res) => {
+  const { code, state } = req.query;
+
+  if (!code) {
+    return res.status(400).send('Missing authorization code.');
   }
 
-  const emailLower = email.trim().toLowerCase();
-  db.get('SELECT email FROM users WHERE email = ?', [emailLower], (err, row) => {
-    if (row) return res.status(400).json({ error: 'User already exists.' });
+  const stateParams = new URLSearchParams(state || '');
+  const isElectron = stateParams.get('source') === 'electron';
+  const token = stateParams.get('token') || '';
 
-    const passwordHash = bcrypt.hashSync(password, 10);
-    const now = new Date().toISOString();
-    const displayName = emailLower.split('@')[0];
+  try {
+    // Exchange the authorization code with kbs-auth server
+    const authServerUrl = process.env.AUTH_SERVER_URL || 'http://localhost:29001';
+    const tokenRes = await fetch(`${authServerUrl}/api/auth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code, client_id: 'tickerclash' })
+    });
 
-    db.run(
-      'INSERT INTO users (email, display_name, password_hash, created_at) VALUES (?, ?, ?, ?)',
-      [emailLower, displayName, passwordHash, now],
-      (insErr) => {
-        if (insErr) return res.status(500).json({ error: 'Registration failed.' });
-        res.status(200).json({ success: true, message: 'User registered successfully.' });
-      }
-    );
-  });
-});
-
-app.post('/api/login', validateCSRF, (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password) return res.status(400).json({ error: 'Email and password required.' });
-
-  const emailLower = email.trim().toLowerCase();
-  db.get('SELECT email, display_name, password_hash, is_google_linked, games_played, games_won FROM users WHERE email = ?', [emailLower], (err, user) => {
-    if (err || !user) return res.status(400).json({ error: 'User not found.' });
-
-    if (!user.password_hash) {
-      return res.status(400).json({
-        error: 'This account was created with Google Sign-in. Please click "Sign in with Google" to access it.'
-      });
+    const tokenData = await tokenRes.json();
+    if (!tokenRes.ok || !tokenData.success) {
+      throw new Error(tokenData.error || 'Failed to exchange auth token.');
     }
 
-    const passwordMatch = bcrypt.compareSync(password, user.password_hash);
-    if (!passwordMatch) return res.status(401).json({ error: 'Incorrect password.' });
+    const { email, displayName } = tokenData.user;
+    const finalDisplayName = displayName || email.split('@')[0];
 
-    const sessionId = crypto.randomBytes(32).toString('hex');
-    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(); // 24 hour session
-    const csrfToken = crypto.randomBytes(24).toString('hex');
+    db.get('SELECT email FROM users WHERE email = ?', [email], (err, user) => {
+      const finalizeLogin = () => {
+        const sessionId = crypto.randomBytes(32).toString('hex');
+        const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+        const csrfToken = crypto.randomBytes(24).toString('hex');
 
-    db.run(
-      'INSERT INTO sessions (id, email, expires_at, csrf_token) VALUES (?, ?, ?, ?)',
-      [sessionId, emailLower, expiresAt, csrfToken],
-      (sessErr) => {
-        if (sessErr) return res.status(500).json({ error: 'Session creation failed.' });
+        db.run(
+          'INSERT INTO sessions (id, email, expires_at, csrf_token) VALUES (?, ?, ?, ?)',
+          [sessionId, email, expiresAt, csrfToken],
+          (sessionErr) => {
+            if (sessionErr) {
+              if (isElectron && token) {
+                pendingAuths.set(token, { error: 'session_fail', createdAt: Date.now() });
+                return renderAuthResponseHtml(res, 'TickerClash Session Error', 'SESSION DEPLOYMENT FAILURE', 'Failed to generate user commander session.', false);
+              }
+              return res.redirect('/?error=session_fail');
+            }
 
-        res.cookie('session_id', sessionId, {
-          httpOnly: true,
-          sameSite: 'lax',
-          maxAge: 24 * 60 * 60 * 1000
-        });
+            res.cookie('session_id', sessionId, {
+              httpOnly: true,
+              path: '/',
+              sameSite: 'lax',
+              secure: req.secure || req.headers['x-forwarded-proto'] === 'https',
+              maxAge: 24 * 60 * 60 * 1000
+            });
 
-        res.cookie('csrf_token', csrfToken, {
-          httpOnly: false,
-          sameSite: 'lax',
-          maxAge: 24 * 60 * 60 * 1000
-        });
+            res.cookie('csrf_token', csrfToken, {
+              httpOnly: false,
+              path: '/',
+              sameSite: 'lax',
+              secure: req.secure || req.headers['x-forwarded-proto'] === 'https',
+              maxAge: 24 * 60 * 60 * 1000
+            });
 
-        res.status(200).json({
-          success: true,
-          sessionId,
-          user: {
-            email: user.email,
-            displayName: user.display_name,
-            isGoogleLinked: user.is_google_linked === 1,
-            hasPassword: user.password_hash !== null,
-            stats: { gamesPlayed: user.games_played, gamesWon: user.games_won }
+            if (isElectron && token) {
+              pendingAuths.set(token, { sessionId, createdAt: Date.now() });
+              return renderAuthResponseHtml(res, 'TickerClash Authenticated', 'COMMAND PROTOCOL ESTABLISHED', 'Commander authenticated successfully. You can now close this tab and return to the TickerClash console.', true);
+            }
+
+            res.redirect('/');
           }
+        );
+      };
+
+      if (user) {
+        db.run('UPDATE users SET display_name = ? WHERE email = ?', [finalDisplayName, email], () => {
+          finalizeLogin();
         });
+      } else {
+        const now = new Date().toISOString();
+        db.run(
+          'INSERT INTO users (email, display_name, password_hash, is_google_linked, created_at) VALUES (?, ?, NULL, 0, ?)',
+          [email, finalDisplayName, now],
+          () => {
+            finalizeLogin();
+          }
+        );
       }
-    );
-  });
+    });
+  } catch (error) {
+    console.error('SSO callback exchange failed:', error);
+    if (isElectron && token) {
+      pendingAuths.set(token, { error: 'oauth_failed', createdAt: Date.now() });
+      return renderAuthResponseHtml(res, 'TickerClash Auth Error', 'AUTHENTICATION FAILURE', 'Failed to link SSO session.', false);
+    }
+    res.redirect('/?error=sso_failed');
+  }
 });
 
 app.get('/api/me', (req, res) => {
@@ -272,30 +328,9 @@ app.post('/api/logout', (req, res) => {
   res.status(200).json({ success: true, message: 'Logged out successfully.' });
 });
 
-// Initialize Google Client
-const googleClient = new OAuth2Client(
-  process.env.GOOGLE_CLIENT_ID,
-  process.env.GOOGLE_CLIENT_SECRET,
-  process.env.GOOGLE_CALLBACK_URL
-);
-
-// In-memory pending auth requests for Electron browser-based polling
-const pendingAuths = new Map();
-
-// Periodic cleanup of expired tokens (> 5 minutes)
-setInterval(() => {
-  const now = Date.now();
-  for (const [token, data] of pendingAuths.entries()) {
-    if (now - data.createdAt > 5 * 60 * 1000) {
-      pendingAuths.delete(token);
-    }
-  }
-}, 60000);
-
-// Endpoint: Check if real Google OAuth is configured on the backend
+// Endpoint: Check if real Google OAuth is configured (Disabled locally, delegated to SSO)
 app.get('/api/auth/google/config', (req, res) => {
-  const isConfigured = !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET);
-  res.status(200).json({ enabled: isConfigured });
+  res.status(200).json({ enabled: true });
 });
 
 // Endpoint: Poll for Electron/Capacitor browser authentication status
@@ -318,17 +353,6 @@ app.get('/api/auth/poll', (req, res) => {
   // Success: return session ID
   pendingAuths.delete(token);
   return res.status(200).json({ status: 'success', sessionId: auth.sessionId });
-});
-
-// 1. Redirect User to Google
-app.get('/api/auth/google', (req, res) => {
-  const state = req.query.state || '';
-  const url = googleClient.generateAuthUrl({
-    access_type: 'offline',
-    scope: ['https://www.googleapis.com/auth/userinfo.email', 'profile'],
-    state: state
-  });
-  res.redirect(url);
 });
 
 // Helper to render HTML auth pages for custom browser flows
@@ -392,104 +416,28 @@ function renderAuthResponseHtml(res, title, header, message, isSuccess) {
   `);
 }
 
-// 2. Handle the Callback from Google
-app.get('/api/auth/callback/google', async (req, res) => {
-  const { code, state } = req.query;
+const HUB_API_URL = process.env.HUB_API_URL || 'http://localhost:29000';
+const HUB_APP_TOKEN = process.env.HUB_APP_TOKEN || 'tickerclash_token_dev_888';
 
-  const stateParams = new URLSearchParams(state || '');
-  const isElectron = stateParams.get('source') === 'electron';
-  const token = stateParams.get('token') || '';
-
+async function unlockHubAchievement(email, achievementId) {
   try {
-    // Exchange code for tokens
-    const { tokens } = await googleClient.getToken(code);
-    googleClient.setCredentials(tokens);
-
-    // Get user info (email)
-    const ticket = await googleClient.verifyIdToken({
-      idToken: tokens.id_token,
-      audience: process.env.GOOGLE_CLIENT_ID,
+    const res = await fetch(`${HUB_API_URL}/api/games-api/achievements/unlock`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-App-Token': HUB_APP_TOKEN
+      },
+      body: JSON.stringify({ email, achievementId })
     });
-    const payload = ticket.getPayload();
-    const email = payload.email.toLowerCase();
-    const displayName = payload.name;
-
-    db.get('SELECT * FROM users WHERE email = ?', [email], (err, user) => {
-      if (user) {
-        if (user.is_google_linked === 0) {
-          db.run('UPDATE users SET is_google_linked = 1 WHERE email = ?', [email]);
-        }
-        finalizeOAuthLogin(req, res, user.email, user.games_played, user.games_won, 1, user.display_name || displayName, user.password_hash !== null, state);
-      } else {
-        const now = new Date().toISOString();
-        db.run(
-          'INSERT INTO users (email, display_name, password_hash, is_google_linked, created_at) VALUES (?, ?, NULL, 1, ?)',
-          [email, displayName, now],
-          function (insertErr) {
-            if (insertErr) {
-              if (isElectron && token) {
-                pendingAuths.set(token, { error: 'db_fail', createdAt: Date.now() });
-                return renderAuthResponseHtml(res, 'TickerClash Command Error', 'CONNECTION FAILURE', 'Database link operation failed.', false);
-              }
-              return res.redirect('/?error=db_fail');
-            }
-            finalizeOAuthLogin(req, res, email, 0, 0, 1, displayName, false, state);
-          }
-        );
-      }
-    });
-  } catch (error) {
-    console.error('Google OAuth Error:', error);
-    if (isElectron && token) {
-      pendingAuths.set(token, { error: 'oauth_failed', createdAt: Date.now() });
-      return renderAuthResponseHtml(res, 'TickerClash OAuth Error', 'AUTHENTICATION FAILURE', 'Google OAuth callback link verification failed.', false);
+    const data = await res.json();
+    if (res.ok && data.success) {
+      console.log(`Successfully unlocked achievement ${achievementId} for user ${email} in Hub.`);
+    } else {
+      console.error(`Hub achievement unlock returned error:`, data.error || data);
     }
-    res.redirect('/?error=oauth_failed');
+  } catch (err) {
+    console.error(`Failed to connect to Hub achievements API:`, err.message);
   }
-});
-
-// Helper to set session cookies
-function finalizeOAuthLogin(req, res, userEmail, gamesPlayed, gamesWon, isGoogleLinked, displayName, hasPassword, state) {
-  const sessionId = crypto.randomBytes(32).toString('hex');
-  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(); // 24 hour session
-  const csrfToken = crypto.randomBytes(24).toString('hex');
-
-  const stateParams = new URLSearchParams(state || '');
-  const isElectron = stateParams.get('source') === 'electron';
-  const token = stateParams.get('token') || '';
-
-  db.run(
-    'INSERT INTO sessions (id, email, expires_at, csrf_token) VALUES (?, ?, ?, ?)',
-    [sessionId, userEmail, expiresAt, csrfToken],
-    (err) => {
-      if (err) {
-        if (isElectron && token) {
-          pendingAuths.set(token, { error: 'session_fail', createdAt: Date.now() });
-          return renderAuthResponseHtml(res, 'TickerClash Session Error', 'SESSION DEPLOYMENT FAILURE', 'Failed to generate user commander session.', false);
-        }
-        return res.redirect('/?error=session_fail');
-      }
-
-      res.cookie('session_id', sessionId, {
-        httpOnly: true,
-        sameSite: 'lax',
-        maxAge: 24 * 60 * 60 * 1000
-      });
-
-      res.cookie('csrf_token', csrfToken, {
-        httpOnly: false,
-        sameSite: 'lax',
-        maxAge: 24 * 60 * 60 * 1000
-      });
-
-      if (isElectron && token) {
-        pendingAuths.set(token, { sessionId, createdAt: Date.now() });
-        return renderAuthResponseHtml(res, 'TickerClash Authenticated', 'COMMAND PROTOCOL ESTABLISHED', 'Commander authenticated successfully. You can now close this tab and return to the TickerClash console.', true);
-      }
-
-      res.redirect('/' + (state ? state : ''));
-    }
-  );
 }
 
 app.post('/api/stats', validateCSRF, (req, res) => {
@@ -506,6 +454,15 @@ app.post('/api/stats', validateCSRF, (req, res) => {
         
         db.get('SELECT games_played, games_won FROM users WHERE email = ?', [user.email], (selErr, row) => {
           if (selErr || !row) return res.status(200).json({ success: true });
+
+          // Background call to Hub to unlock achievements
+          if (won) {
+            unlockHubAchievement(user.email, 'tickerclash_first_victory');
+          }
+          if (row.games_played >= 5) {
+            unlockHubAchievement(user.email, 'tickerclash_veteran');
+          }
+
           res.status(200).json({
             success: true,
             stats: { gamesPlayed: row.games_played, gamesWon: row.games_won }
@@ -899,3 +856,37 @@ const HOST = process.env.HOST || '0.0.0.0';
 app.listen(PORT, HOST, () => {
   console.log(`TickerClash server running on http://${HOST}:${PORT}`);
 });
+
+if (process.env.FRONTEND_PORT && String(process.env.FRONTEND_PORT) !== String(PORT)) {
+  const frontendApp = express();
+  const http = require('http');
+
+  // Proxy API requests to the backend server
+  frontendApp.all('/api/*splat', (req, res) => {
+    const connector = http.request({
+      host: 'localhost',
+      port: PORT,
+      path: req.originalUrl,
+      method: req.method,
+      headers: req.headers
+    }, (connectorRes) => {
+      res.writeHead(connectorRes.statusCode, connectorRes.headers);
+      connectorRes.pipe(res);
+    });
+
+    req.pipe(connector);
+
+    connector.on('error', (err) => {
+      console.error('TickerClash frontend proxy error:', err);
+      res.status(502).send('Bad Gateway');
+    });
+  });
+
+  frontendApp.use(express.static(path.join(__dirname, 'dist')));
+  frontendApp.get('*splat', (req, res) => {
+    res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+  });
+  frontendApp.listen(process.env.FRONTEND_PORT, () => {
+    console.log(`TickerClash static frontend server running on port ${process.env.FRONTEND_PORT}`);
+  });
+}

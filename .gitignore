@@ -28,3 +28,7 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Commit & Changelog drafts
+NEXT_COMMIT.txt
+NEXT_CHANGELOG.md

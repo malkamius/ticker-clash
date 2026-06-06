@@ -1,11 +1,11 @@
-# Changelog - TickerClash v1.2.0
+# Changelog - TickerClash Port Restructuring
 
-## New Features
-* **Sign in with Google**: You can now securely log in to your account using your Gmail credentials.
-* **AI Opponents**: Play solo or fill empty spots in multiplayer games with AI opponents of configurable difficulties (Easy, Medium, Hard).
-* **Flexible Game Modes**: Added an option to set the turn limit to `0` for infinite match play.
-* **Lobby & Local Multiplayer Transitions**: Seamlessly transition between local players' turns with standard pause and overlay prompts.
-* **Centralized Secret Manager**: System configurations and secret credentials are now safely managed in a central system directory, preventing accidental exposure.
+## Bug Fixes
+- Fixed a startup crash in Express 5 caused by wildcard routing pattern incompatibility with path-to-regexp v8.
+- Fixed an issue where the production/preview SSO callback and achievements failed to connect because of missing `AUTH_SERVER_URL` and `HUB_API_URL` environment variables in systemd.
 
 ## Changes
-* **Production Deployment Ready**: Automated deployment pipeline created to ease launching instances of the game server as a system background service.
+- Configured local development ports to Frontend: 28003 / Backend: 29003.
+- Configured live preview ports to Frontend: 19003 / Backend: 20003.
+- Added dual-port static serving on port 19003 and backend API on port 20003 in the preview environment.
+- Configured dynamic dev/preview SSO redirection helpers.

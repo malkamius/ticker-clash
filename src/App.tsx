@@ -284,16 +284,7 @@ function PassTurnOverlay({ nextPlayer, onStartTurn, onCancelEndTurn, endedPlayer
 export default function App() {
   const [user, setUser] = useState<UserAccount | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState<'login' | 'register'>('login');
-  
-  // Auth Form State
-  const [emailInput, setEmailInput] = useState('');
-  const [passwordInput, setPasswordInput] = useState('');
   const [authError, setAuthError] = useState('');
-  const [authSuccess, setAuthSuccess] = useState('');
-
-  // Google OAuth State
-  const [isGoogleAuthEnabled, setIsGoogleAuthEnabled] = useState(false);
   const [isGooglePolling, setIsGooglePolling] = useState(false);
 
   // Dashboard state
@@ -370,13 +361,7 @@ export default function App() {
           }
         }
       });
-    });
-
-    // Check Google OAuth config
-    authService.checkGoogleOAuthConfig().then((config) => {
-      setIsGoogleAuthEnabled(config.enabled);
-    });
-  }, []);
+    });  }, []);
 
   // Poll for Google Sign-in completion if pending token exists
   useEffect(() => {
@@ -470,37 +455,33 @@ export default function App() {
     }
   };
 
-  const handleRegister = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setAuthError('');
-    setAuthSuccess('');
-    const res = await authService.registerUser(emailInput, passwordInput);
-    if (res.success) {
-      setAuthSuccess('Account registered. You can now log in.');
-      setActiveTab('login');
-      setPasswordInput('');
-    } else {
-      setAuthError(res.message);
-    }
-  };
-
-  const handleLogin = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setAuthError('');
-    const res = await authService.loginUser(emailInput, passwordInput);
-    if (res.success && res.user) {
-      setUser(res.user);
-      loadGames();
-    } else {
-      setAuthError(res.message);
-    }
-  };
+  // Removed local registration/login handlers (managed centrally by KBS SSO)
 
   const handleLogout = async () => {
     await authService.logoutUser();
     setUser(null);
     setCurrentGameId(null);
     setCurrentGame(null);
+
+    const isPackaged = typeof window !== 'undefined' && 
+                       (window.location.protocol === 'file:' || 
+                        window.location.hostname === '' ||
+                        navigator.userAgent.toLowerCase().includes('electron'));
+
+    if (!isPackaged) {
+      const authProto = window.location.protocol === 'https:' ? 'https:' : 'http:';
+      const getAuthServerUrl = () => {
+        if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
+          const port = window.location.port;
+          if (port === '28003' || port === '29003') {
+            return 'http://localhost:28001';
+          }
+          return 'http://localhost:19001';
+        }
+        return `${authProto}//auth.kbs-cloud.com`;
+      };
+      window.location.href = `${getAuthServerUrl()}/api/auth/logout?redirect_uri=${encodeURIComponent(window.location.origin)}`;
+    }
   };
 
   const handleCreateGame = async (e: React.FormEvent) => {
@@ -683,7 +664,7 @@ export default function App() {
             ESTABLISHING SECURE LINK
           </h2>
           <div className="font-mono text-sm text-[#94a3b8] leading-relaxed">
-            Please complete Google authentication in your default web browser.
+            Please complete authentication in your default web browser.
           </div>
           <div className="inline-block mx-auto w-10 h-10 border-4 border-t-neon-cyan border-white/10 rounded-full animate-spin" />
           <div className="font-mono text-xs uppercase text-secondary tracking-wider">
@@ -714,6 +695,45 @@ export default function App() {
     );
   }
 
+  // Helper redirect to central auth
+  const redirectToAuth = () => {
+    const isPackaged = typeof window !== 'undefined' && 
+                       (window.location.protocol === 'file:' || 
+                        window.location.hostname === '' ||
+                        navigator.userAgent.toLowerCase().includes('electron'));
+                        
+    // Callback endpoint on Ticker-Clash backend
+    const localBackendBase = isPackaged ? 'http://localhost:20003' : window.location.origin;
+    const redirectUri = `${localBackendBase}/api/auth/callback`;
+    
+    const authProto = window.location.protocol === 'https:' ? 'https:' : 'http:';
+    const getAuthServerUrl = () => {
+      if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
+        const port = window.location.port;
+        if (port === '28003' || port === '29003') {
+          return 'http://localhost:28001';
+        }
+        return 'http://localhost:19001';
+      }
+      return `${authProto}//auth.kbs-cloud.com`;
+    };
+    let targetUrl = `${getAuthServerUrl()}/api/auth/authorize?client_id=tickerclash&redirect_uri=${encodeURIComponent(redirectUri)}`;
+    
+    if (isPackaged) {
+      const token = Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+      localStorage.setItem('tickerclash_auth_pending_token', token);
+      
+      const stateParam = `source=electron&token=${token}`;
+      targetUrl += `&state=${encodeURIComponent(stateParam)}`;
+      
+      // In electron, open external browser
+      window.open(targetUrl, '_blank');
+      setIsGooglePolling(true); // Open the backdrop modal showing "waiting for browser validation"
+    } else {
+      window.location.href = targetUrl;
+    }
+  };
+
   // --- LOGIN SCREEN ---
   if (!user) {
     return (
@@ -727,142 +747,18 @@ export default function App() {
           </div>
 
           {authError && (
-            <div className="mb-4 border border-[#ff007f]/30 bg-[#ff007f]/10 p-3 text-center font-mono text-xs text-neon-magenta">
+            <div className="mb-6 border border-[#ff007f]/30 bg-[#ff007f]/10 p-3 text-center font-mono text-xs text-neon-magenta">
               ERROR: {authError}
             </div>
           )}
 
-          {authSuccess && (
-            <div className="mb-4 border border-[#39ff14]/30 bg-[#39ff14]/10 p-3 text-center font-mono text-xs text-neon-green">
-              SUCCESS: {authSuccess}
-            </div>
-          )}
+          <div className="flex flex-col gap-4 text-center font-mono text-xs text-[#94a3b8] mb-6">
+            Authentication is managed centrally by KBS Cloud SSO. Click below to establish a secure trader connection link.
+          </div>
 
-          {activeTab === 'login' ? (
-            <form onSubmit={handleLogin} className="flex flex-col gap-4">
-              <div className="flex flex-col gap-1">
-                <label className="font-mono text-xs uppercase text-secondary">Email Address</label>
-                <input 
-                  type="email" 
-                  required
-                  className="terminal-input"
-                  placeholder="name@megacorp.com" 
-                  value={emailInput}
-                  onChange={e => setEmailInput(e.target.value)}
-                />
-              </div>
-              <div className="flex flex-col gap-1">
-                <label className="font-mono text-xs uppercase text-secondary">Access Token</label>
-                <input 
-                  type="password" 
-                  required
-                  className="terminal-input" 
-                  placeholder="••••••••"
-                  value={passwordInput}
-                  onChange={e => setPasswordInput(e.target.value)}
-                />
-              </div>
-              <button type="submit" className="btn-sci-fi mt-2 py-3 font-mono">
-                ESTABLISH CONNECTION
-              </button>
-
-              {isGoogleAuthEnabled && (
-                <>
-                  <div className="flex items-center gap-3 my-1">
-                    <div className="flex-grow h-[1px] bg-white/10" />
-                    <span className="font-mono text-[10px] text-secondary uppercase">OR</span>
-                    <div className="flex-grow h-[1px] bg-white/10" />
-                  </div>
-
-                  <button
-                    type="button"
-                    className="btn-sci-fi w-full py-2.5 font-mono flex items-center justify-center gap-2"
-                    style={{
-                      background: 'rgba(255, 255, 255, 0.03)',
-                      borderColor: 'rgba(255, 255, 255, 0.1)',
-                      color: '#ffffff'
-                    }}
-                    onClick={() => {
-                      let stateParam = window.location.search;
-                      const isPackaged = typeof window !== 'undefined' && 
-                                         (window.location.protocol === 'file:' || 
-                                          window.location.hostname === '' ||
-                                          navigator.userAgent.toLowerCase().includes('electron'));
-
-                      if (isPackaged) {
-                        const token = Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
-                        localStorage.setItem('tickerclash_auth_pending_token', token);
-
-                        const params = new URLSearchParams(stateParam);
-                        params.set('source', 'electron');
-                        params.set('token', token);
-                        stateParam = '?' + params.toString();
-                      }
-
-                      const base = '';
-                      const targetUrl = `${base}/api/auth/google?state=${encodeURIComponent(stateParam)}`;
-
-                      window.location.href = targetUrl;
-                    }}
-                  >
-                    <svg width="18" height="18" viewBox="0 0 18 18">
-                      <path fill="#4285F4" d="M17.64 9.2c0-.63-.06-1.25-.16-1.84H9v3.47h4.84c-.21 1.12-.84 2.07-1.79 2.7v2.24h2.9c1.69-1.55 2.69-3.85 2.69-6.57z"/>
-                      <path fill="#34A853" d="M9 18c2.43 0 4.47-.8 5.96-2.23l-2.9-2.24c-.8.54-1.84.87-3.06.87-2.35 0-4.34-1.58-5.05-3.72H.95v2.3C2.43 15.89 5.5 18 9 18z"/>
-                      <path fill="#FBBC05" d="M3.95 10.68c-.18-.54-.28-1.12-.28-1.68s.1-1.14.28-1.68V5.02H.95C.34 6.22 0 7.57 0 9s.34 2.78.95 3.98l3-2.3z"/>
-                      <path fill="#EA4335" d="M9 3.58c1.32 0 2.5.45 3.44 1.35l2.58-2.59C13.47.89 11.43 0 9 0 5.5 0 2.43 2.11.95 5.02l3 2.3c.71-2.14 2.7-3.72 5.05-3.72z"/>
-                    </svg>
-                    SIGN IN WITH GOOGLE
-                  </button>
-                </>
-              )}
-              <div className="mt-4 text-center">
-                <button 
-                  type="button" 
-                  onClick={() => { setActiveTab('register'); setAuthError(''); }}
-                  className="font-mono text-xs uppercase text-secondary hover:text-neon-cyan"
-                >
-                  Create Faction Account
-                </button>
-              </div>
-            </form>
-          ) : (
-            <form onSubmit={handleRegister} className="flex flex-col gap-4">
-              <div className="flex flex-col gap-1">
-                <label className="font-mono text-xs uppercase text-secondary">Email Address</label>
-                <input 
-                  type="email" 
-                  required
-                  className="terminal-input"
-                  placeholder="name@megacorp.com" 
-                  value={emailInput}
-                  onChange={e => setEmailInput(e.target.value)}
-                />
-              </div>
-              <div className="flex flex-col gap-1">
-                <label className="font-mono text-xs uppercase text-secondary">Secure Faction Password</label>
-                <input 
-                  type="password" 
-                  required
-                  className="terminal-input" 
-                  placeholder="Min 6 characters"
-                  value={passwordInput}
-                  onChange={e => setPasswordInput(e.target.value)}
-                />
-              </div>
-              <button type="submit" className="btn-sci-fi mt-2 py-3 font-mono">
-                REGISTER FACTION CREDENTIALS
-              </button>
-              <div className="mt-4 text-center">
-                <button 
-                  type="button" 
-                  onClick={() => { setActiveTab('login'); setAuthError(''); }}
-                  className="font-mono text-xs uppercase text-secondary hover:text-neon-cyan"
-                >
-                  Return to Login
-                </button>
-              </div>
-            </form>
-          )}
+          <button onClick={redirectToAuth} className="btn-sci-fi w-full py-3 font-mono tracking-widest">
+            ESTABLISH CONNECTION
+          </button>
         </div>
       </div>
     );
